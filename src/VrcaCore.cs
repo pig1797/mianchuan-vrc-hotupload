@@ -744,11 +744,7 @@ namespace VrcaUploader
             if (string.IsNullOrEmpty(releaseStatus)) releaseStatus = "private";
 
             var worldCompression = ResolveHotswapCompression(req.HotswapCompression);
-            var hasRuntimeProgramPatches =
-                !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("HOTUPLOAD_RUNE_PATCH")) ||
-                !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("HOTUPLOAD_PROG_REPLACE"));
-            var inputAlreadyPrepared = !hasRuntimeProgramPatches &&
-                preflight != null &&
+            var inputAlreadyPrepared = preflight != null &&
                 string.Equals(preflight.WorldId, newWorldId, StringComparison.OrdinalIgnoreCase);
             // A new upload gets a fresh wrld_ id every time, so an id-bound
             // prepared cache can never be reused by the next new-world task.
@@ -946,7 +942,7 @@ namespace VrcaUploader
             var bundleUrl = ApiBaseUrl + "file/" + bundleFileId + "/1/file";
             var imageUrl = ApiBaseUrl + "file/" + imageFileId + "/1/file";
             var body = new Dictionary<string, object>();
-            body["name"] = string.IsNullOrWhiteSpace(req.Name) ? "Ecliptica" : req.Name;
+            body["name"] = string.IsNullOrWhiteSpace(req.Name) ? "World" : req.Name;
             body["description"] = req.Description ?? "";
             body["assetUrl"] = bundleUrl;
             body["imageUrl"] = imageUrl;
@@ -2280,14 +2276,6 @@ namespace VrcaUploader
             psi.CreateNoWindow = true;
             psi.StandardOutputEncoding = Encoding.UTF8;
             psi.StandardErrorEncoding = Encoding.UTF8;
-            // 透传可选的符文 patch 指令给 HotswapTool 子进程(仅当主程序环境里设了才透传)
-            var runePatch = Environment.GetEnvironmentVariable("HOTUPLOAD_RUNE_PATCH");
-            if (!string.IsNullOrWhiteSpace(runePatch))
-                psi.EnvironmentVariables["HOTUPLOAD_RUNE_PATCH"] = runePatch;
-            var progReplace = Environment.GetEnvironmentVariable("HOTUPLOAD_PROG_REPLACE");
-            if (!string.IsNullOrWhiteSpace(progReplace))
-                psi.EnvironmentVariables["HOTUPLOAD_PROG_REPLACE"] = progReplace;
-
             using (var process = new Process())
             {
                 process.StartInfo = psi;
@@ -2624,11 +2612,9 @@ namespace VrcaUploader
         string BuildPreparedWorldCachePath(string sourcePath, string worldId, int? compression, string platform)
         {
             var sourceHash = ComputeFileSha256Hex(sourcePath);
-            var material = sourceHash + "|" + worldId + "|" +
+            var material = "prepared-world-v2|" + sourceHash + "|" + worldId + "|" +
                 (platform ?? "") + "|" +
                 (compression.HasValue ? compression.Value.ToString(CultureInfo.InvariantCulture) : "original") + "|" +
-                (Environment.GetEnvironmentVariable("HOTUPLOAD_RUNE_PATCH") ?? "") + "|" +
-                (Environment.GetEnvironmentVariable("HOTUPLOAD_PROG_REPLACE") ?? "") + "|" +
                 (Environment.GetEnvironmentVariable("HOTUPLOAD_CAB_OVERRIDE") ?? "") + "|" +
                 (Environment.GetEnvironmentVariable("HOTUPLOAD_RANDOMIZE_CAB") ?? "");
             var key = ComputeSha256Hex(Encoding.UTF8.GetBytes(material)).Substring(0, 24).ToLowerInvariant();

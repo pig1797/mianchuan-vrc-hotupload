@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
-using System.IO.Compression;
 using System.Text;
 using System.Threading.Tasks;
 using AssetsTools.NET;
@@ -89,8 +88,8 @@ static class Program
         var originalCompression = probeBundle.originalCompression;
         var originalBlockInfos = CloneBlockInfos(probeBundle.file.BlockAndDirInfo.BlockInfos);
         bool originalBlockDirAtEnd = HasFlag(originalFlags, AssetBundleFSHeaderFlags.BlockAndDirAtEnd);
-        // 默认跟随原包的 blockDirAtEnd, 而不是写死 true。实测 Ecliptica 世界原包=false 且能跑,
-        // 写死 true 会翻转结构布局(能跑的服务器版 Ecliptica716 实测也是 false)。仅命令行显式指定时才覆盖。
+        // 默认跟随原包的 blockDirAtEnd，避免无必要地改变 UnityFS 结构布局。
+        // 仅命令行显式指定时才覆盖。
         bool outputBlockDirAtEnd = requestedBlockDirAtEnd ?? originalBlockDirAtEnd;
         var workingInputPath = inPath;
         var sourceUnpackedPath = "";
@@ -464,25 +463,6 @@ static class Program
         Console.WriteLine("[2] Writing modified assets file (dir " + targetDirIndex + ")...");
         bun.file.BlockAndDirInfo.DirectoryInfos[targetDirIndex].SetNewData(targetAfi.file);
 
-        // ── 可选: 符文解锁字节 patch (HOTUPLOAD_RUNE_PATCH=<pathId>:<decompOffset>:<hexBytes>) ──
-        // 在同一 bundle 对象上、用与 blueprintId 相同的 SetNewData 机制改 p13467 的
-        // serializedProgramCompressedBytes(解压→改字节→重压→写回),随后由本工具统一 Pack。
-        // 绕开外部 patchtool 的有害预重打包(会丢 0x200 flag)。
-        var runePatchEnv = Environment.GetEnvironmentVariable("HOTUPLOAD_RUNE_PATCH");
-        if (!string.IsNullOrWhiteSpace(runePatchEnv))
-        {
-            TryApplyRunePatch(am, bun, runePatchEnv);
-        }
-
-        // ── 可选: 整程序替换 (HOTUPLOAD_PROG_REPLACE=<pathId>:<解压文件>;<pathId2>:<文件2>) ──
-        // 用预制的解压程序数据(含召唤/开键改造)替换整个 serializedProgramCompressedBytes,
-        // 复用上传时 proven 能成的 load+pack, 绕开独立打包工具崩溃。
-        var progReplaceEnv = Environment.GetEnvironmentVariable("HOTUPLOAD_PROG_REPLACE");
-        if (!string.IsNullOrWhiteSpace(progReplaceEnv))
-        {
-            TryReplacePrograms(am, bun, progReplaceEnv);
-        }
-
         bool forceCab = IsTruthySetting(Environment.GetEnvironmentVariable("HOTUPLOAD_RANDOMIZE_CAB")) ||
                         !string.IsNullOrWhiteSpace(GetCabOverrideSetting());
         string rawPath = outPath + ".raw";
@@ -537,10 +517,6 @@ static class Program
 
     }
 
-    // 支持多补丁: 用 ';' 分隔多个 "<pathId>:<off>:<hex>",
-    // 如 "13496:82929:00000001000001C9;13496:83357:00000001000001C9"
-    // HOTUPLOAD_PROG_REPLACE=<pathId>:<解压文件>;<pathId2>:<文件2>
-    // 用预制解压数据gzip后替换整个serializedProgramCompressedBytes
     private static void NativeUnpackWorldLzmaSingleBlock(
         AssetBundleFile sourceBundle,
         string inputPath,
@@ -1590,119 +1566,6 @@ static class Program
         public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
         public override void SetLength(long value) { throw new NotSupportedException(); }
         public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
-    }
-
-    private static void TryReplacePrograms(AssetsManager am, BundleFileInstance bun, string specs)
-    {
-        var targets = new Dictionary<long, byte[]>();
-        foreach (var one in specs.Split(';'))
-        {
-            var s = one.Trim(); if (s.Length == 0) continue;
-            int c = s.IndexOf(':'); if (c < 0) continue;
-            long pid = long.Parse(s.Substring(0, c).Trim());
-            string file = s.Substring(c + 1).Trim();
-            byte[] dec = File.ReadAllBytes(file);
-            byte[] gz;
-            using (var o = new MemoryStream()) { using (var g = new System.IO.Compression.GZipStream(o, System.IO.Compression.CompressionLevel.Optimal)) g.Write(dec, 0, dec.Length); gz = o.ToArray(); }
-            targets[pid] = gz;
-            Console.WriteLine("[PROGREP] 待替换 pathId=" + pid + " 解压=" + dec.Length + " gzip=" + gz.Length);
-        }
-        int dc = bun.file.BlockAndDirInfo.DirectoryInfos.Count; int done = 0;
-        for (int di = 0; di < dc; di++)
-        {
-            var dn = bun.file.BlockAndDirInfo.DirectoryInfos[di].Name ?? "";
-            if (IsResourceEntry(dn)) continue;
-            AssetsFileInstance afi; try { afi = am.LoadAssetsFileFromBundle(bun, di, true); } catch { continue; }
-            if (afi == null || afi.file == null) continue;
-            bool changed = false;
-            foreach (var inf in afi.file.GetAssetsOfType((AssetClassID)114))
-            {
-                if (!targets.ContainsKey(inf.PathId)) continue;
-                AssetTypeValueField bf; try { bf = am.GetBaseField(afi, inf); } catch { continue; }
-                var comp = bf["serializedProgramCompressedBytes"];
-                if (comp == null || comp["Array"] == null) continue;
-                comp["Array"].AsByteArray = targets[inf.PathId];
-                inf.SetNewData(bf); changed = true; done++;
-                Console.WriteLine("[PROGREP] 已替换 pathId=" + inf.PathId + " dir=" + di);
-            }
-            if (changed) bun.file.BlockAndDirInfo.DirectoryInfos[di].SetNewData(afi.file);
-        }
-        Console.WriteLine("[PROGREP] 替换完成 " + done + "/" + targets.Count);
-    }
-
-    private static void TryApplyRunePatch(AssetsManager am, BundleFileInstance bun, string specs)
-    {
-        foreach (var one in specs.Split(';'))
-        {
-            var s = one.Trim();
-            if (s.Length > 0) ApplyOnePatch(am, bun, s);
-        }
-    }
-
-    // spec = "<pathId>:<decompOffset>:<hexBytes>", 如 "13467:58069:000000040000E1E8"
-    private static void ApplyOnePatch(AssetsManager am, BundleFileInstance bun, string spec)
-    {
-        try
-        {
-            var parts = spec.Split(':');
-            if (parts.Length != 3) { Console.WriteLine("[RUNE] spec 格式错误, 跳过: " + spec); return; }
-            long pathId = long.Parse(parts[0].Trim());
-            int off = int.Parse(parts[1].Trim());
-            string hex = parts[2].Trim();
-            byte[] patchBytes = new byte[hex.Length / 2];
-            for (int i = 0; i < patchBytes.Length; i++) patchBytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
-
-            int dc = bun.file.BlockAndDirInfo.DirectoryInfos.Count;
-            for (int di = 0; di < dc; di++)
-            {
-                var dn = bun.file.BlockAndDirInfo.DirectoryInfos[di].Name ?? "";
-                if (IsResourceEntry(dn)) continue;
-                AssetsFileInstance afi;
-                try { afi = am.LoadAssetsFileFromBundle(bun, di, true); } catch { continue; }
-                if (afi == null || afi.file == null) continue;
-
-                foreach (var inf in afi.file.GetAssetsOfType((AssetClassID)114))
-                {
-                    if (inf.PathId != pathId) continue;
-                    AssetTypeValueField bf;
-                    try { bf = am.GetBaseField(afi, inf); } catch { continue; }
-                    var comp = bf["serializedProgramCompressedBytes"];
-                    if (comp == null || comp.FieldName == "DUMMY") { Console.WriteLine("[RUNE] no compressed field on " + pathId); return; }
-                    byte[] czip = comp["Array"].AsByteArray;
-                    if (czip == null || czip.Length < 3) { Console.WriteLine("[RUNE] empty compressed on " + pathId); return; }
-
-                    byte[] dec;
-                    using (var ms = new MemoryStream(czip))
-                    using (var gz = new GZipStream(ms, CompressionMode.Decompress))
-                    using (var o = new MemoryStream()) { gz.CopyTo(o); dec = o.ToArray(); }
-
-                    Console.Write("[RUNE] pathId=" + pathId + " off=" + off + " BEFORE: ");
-                    for (int k = 0; k < patchBytes.Length; k++) Console.Write(dec[off + k].ToString("X2") + " ");
-                    Console.WriteLine();
-                    for (int k = 0; k < patchBytes.Length; k++) dec[off + k] = patchBytes[k];
-                    Console.Write("[RUNE] pathId=" + pathId + " off=" + off + " AFTER : ");
-                    for (int k = 0; k < patchBytes.Length; k++) Console.Write(dec[off + k].ToString("X2") + " ");
-                    Console.WriteLine();
-
-                    byte[] rec;
-                    using (var o = new MemoryStream())
-                    {
-                        using (var gz = new GZipStream(o, CompressionLevel.Optimal)) gz.Write(dec, 0, dec.Length);
-                        rec = o.ToArray();
-                    }
-                    comp["Array"].AsByteArray = rec;
-                    inf.SetNewData(bf);
-                    bun.file.BlockAndDirInfo.DirectoryInfos[di].SetNewData(afi.file);
-                    Console.WriteLine("[RUNE] patched & re-gzipped: " + czip.Length + " -> " + rec.Length + " B, dir=" + di);
-                    return;
-                }
-            }
-            Console.WriteLine("[RUNE] pathId " + pathId + " not found; skip");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine("[RUNE] patch failed (non-fatal): " + ex.GetType().Name + ": " + ex.Message);
-        }
     }
 
     private static void VerifyWorldSelection(string rawPath, string expectedWorldId, string tpk)
